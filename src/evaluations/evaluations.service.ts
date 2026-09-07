@@ -43,17 +43,15 @@ const CRITERIA: CriterionDef[] = [
 const FAIL_VALUE = "ไม่เป็นไปตามมาตรฐาน";
  
 // The raw-data collection has 144 columns; the aggregation logic below only
-// ever reads this subset (the other ~115 are free-text audit/notes fields
-// in Thai that we never use). Projecting them out at the query level cuts
-// the payload MongoDB has to send — and the memory Node has to hold —
-// down substantially, which is most of what makes the first (cold-cache)
-// load slow.
+// ever reads this subset. `ul` (unit) and `skill` were added so agents can
+// be sorted/displayed by them, on top of the existing department/group.
 const FIELD_PROJECTION = {
   evaluatee_full_name: 1,
   employee_email: 1,
   position: 1,
   department: 1,
   group: 1,
+  skill_phone: 1,
   evaluation_date: 1,
   evaluation_result: 1,
   score_sum: 1,
@@ -76,40 +74,38 @@ export class EvaluationsService implements OnModuleInit {
  
   // Runs once when the Nest app finishes booting — pre-loads the raw-data
   // cache immediately, so whoever's browser hits the dashboard/reports page
-  // FIRST doesn't have to pay for the cold-cache fetch themselves. By the
-  // time anyone can actually reach the frontend, this has usually already
-  // finished in the background.
+  // FIRST doesn't have to pay for the cold-cache fetch themselves.
   async onModuleInit() {
+    // Blocking on purpose: the app won't report "started" (and nginx won't
+    // have anything to proxy to) until this finishes — but that means
+    // whoever visits gets a fast, already-warm page instead of triggering
+    // the slow Mongo fetch themselves on first load. Revisit this once the
+    // underlying Mongo/Atlas latency from inside Docker is actually fixed
+    // (see the DNS diagnostic) — at that point this delay should shrink to
+    // something small enough that this tradeoff stops mattering either way.
+    await this.warmCaches();
+  }
+ 
+  private async warmCaches() {
     const start = Date.now();
     try {
       const records = await this.getAllRecords();
       this.logger.log(`Warmed raw-data cache: ${records.length} records in ${Date.now() - start}ms`);
     } catch (err) {
       this.logger.warn(`Cache warm-up failed (will retry on first request): ${err}`);
+      return;
     }
  
-    // Also pre-compute the summary for the most likely first clicks —
-    // "All Departments" across all three periods — so switching This Week
-    // / This Month / This Year is instant even before anyone's requested
-    // that specific combo yet. Department-specific combos still compute
-    // on first request (we don't know which department someone will pick),
-    // but those are cheap once the raw-data cache above is warm.
-    const periods: Period[] = ["week", "month", "year"];
-    for (const p of periods) {
-      const t = Date.now();
-      try {
-        await this.getDashboardSummary(undefined, p);
-        this.logger.log(`Warmed dashboard summary (all, ${p}) in ${Date.now() - t}ms`);
-      } catch (err) {
-        this.logger.warn(`Summary warm-up failed for period=${p}: ${err}`);
-      }
+    const t = Date.now();
+    try {
+      await this.getDashboardSummary(undefined, undefined, undefined, undefined, undefined);
+      this.logger.log(`Warmed default dashboard summary in ${Date.now() - t}ms`);
+    } catch (err) {
+      this.logger.warn(`Summary warm-up failed: ${err}`);
     }
   }
  
   // The one place that actually talks to MongoDB for the full collection.
-  // Every method below calls this instead of querying directly, so a full
-  // 26k-document scan happens at most once per cache TTL window instead of
-  // once per request.
   private async getAllRecords(): Promise<any[]> {
     const cached = await this.cacheManager.get<any[]>(EvaluationsService.RECORDS_CACHE_KEY);
     if (cached) return cached;
@@ -121,16 +117,8 @@ export class EvaluationsService implements OnModuleInit {
     return records;
   }
  
-  // Call this after a re-import of raw-data, or wire it to a webhook/cron
-  // if the import pipeline can trigger it automatically. Without this, the
-  // cache just naturally expires after the TTL set in AppModule.
   async invalidateCache() {
     await this.cacheManager.del(EvaluationsService.RECORDS_CACHE_KEY);
-    // Per-department trend caches use dynamic keys (trend:<department>),
-    // so there's no single key to clear here — they'll fall out naturally
-    // after their own TTL. If exact invalidation matters later, this would
-    // need to track department names separately or switch stores to one
-    // that supports pattern-based deletion.
   }
  
   // Distinct department names, for the dashboard's department filter dropdown.
@@ -144,35 +132,60 @@ export class EvaluationsService implements OnModuleInit {
     return [...set].sort((a, b) => a.localeCompare(b));
   }
  
-  async getDashboardSummary(department?: string, period: Period = "month") {
+  // Distinct unit (group) and skill (skill_phone) values, for the
+  // dashboard's Unit and Skill filter dropdowns — same pattern as
+  // getDepartments above.
+  async getUnits(): Promise<string[]> {
+    return this.getDistinctValues("group");
+  }
+ 
+  async getSkills(): Promise<string[]> {
+    return this.getDistinctValues("skill_phone");
+  }
+ 
+  private async getDistinctValues(field: "department" | "group" | "skill_phone"): Promise<string[]> {
+    const records = await this.getAllRecords();
+    const set = new Set<string>();
+    for (const r of records) {
+      const value = typeof r[field] === "string" ? r[field].trim() : "";
+      if (value) set.add(value);
+    }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }
+ 
+  // department: optional filter, applies to the whole page.
+  // from / to: optional ISO date strings ("YYYY-MM-DD") from the calendar
+  // range picker. When omitted, falls back to "the latest month present
+  // in the data" (same behavior as before the range picker existed), so
+  // the dashboard still shows something sensible on first load.
+  async getDashboardSummary(
+    department?: string,
+    unit?: string,
+    skill?: string,
+    from?: string,
+    to?: string
+  ) {
     const t0 = Date.now();
     const all = await this.getAllRecords();
     const tRecords = Date.now();
  
-    // Department filter applies to the entire page — KPI tiles, error
-    // lists, status counts, agents list, AND the trend chart's data.
-    const records =
-      department && department !== "all" ? all.filter((r) => r.department === department) : all;
+    let records = department && department !== "all" ? all.filter((r) => r.department === department) : all;
+    if (unit && unit !== "all") records = records.filter((r) => r.group === unit);
+    if (skill && skill !== "all") records = records.filter((r) => r.skill_phone === skill);
  
     const { currentRecords, previousRecords, periodLabel, previousPeriodLabel } =
-      this.resolvePeriod(records, period);
+      this.resolveDateRange(records, from, to);
     const tPeriod = Date.now();
  
     const currentStats = this.computeStats(currentRecords);
     const previousStats = this.computeStats(previousRecords);
     const tStats = Date.now();
  
-    // Status counts and the agents-below-90 list are scoped to the SAME
-    // current period + department filter as the KPI tiles above, so the
-    // whole page reflects one consistent slice of data.
     const statusCoachCount = currentRecords.filter((r) => r.status_flow === "Completed").length;
     const statusAcknowledgeCount = currentRecords.filter((r) => r.status_acknowledge === "Complete").length;
  
-    // Single pass — name/email are captured directly in the map entry, so
-    // building agentsBelow90 below never needs to search back through
-    // currentRecords (that used to be an O(agents × records) find-inside-map,
-    // which got noticeably slower once the period selector could make
-    // currentRecords span a whole year instead of just one month).
+    // Single pass — name/email captured directly in the map entry, so no
+    // second scan through currentRecords is needed afterward.
     const byAgent = new Map<string, { name: string; email: string; sum: number; count: number }>();
     for (const r of currentRecords) {
       const key = r.employee_email ?? r.evaluatee_full_name;
@@ -192,24 +205,20 @@ export class EvaluationsService implements OnModuleInit {
       .sort((a, b) => a.score - b.score);
     const tAgents = Date.now();
  
-    // Trend doesn't depend on `period` at all — only on department — so
-    // switching between This Week / This Month / This Year was previously
-    // recomputing three identical full bucket passes over the entire
-    // department's records every single time. Cached separately, keyed
-    // only by department, so that redundant work happens at most once
-    // per cache TTL window instead of on every period click.
-    const trend = await this.getTrendForDepartment(department, records);
+    // Trend doesn't depend on the selected date range — only on which
+    // department/unit/skill filters are active — so it's cached
+    // separately, keyed by that filter combination.
+    const trend = await this.getTrendForFilters(department, unit, skill, records);
     const tTrend = Date.now();
  
     this.logger.log(
-      `getDashboardSummary(department=${department ?? "all"}, period=${period}): ` +
+      `getDashboardSummary(department=${department ?? "all"}, from=${from ?? "-"}, to=${to ?? "-"}): ` +
         `records=${tRecords - t0}ms period=${tPeriod - tRecords}ms stats=${tStats - tPeriod}ms ` +
         `agents=${tAgents - tStats}ms trend=${tTrend - tAgents}ms total=${tTrend - t0}ms`
     );
  
     return {
       department: department && department !== "all" ? department : "all",
-      period,
       periodLabel,
       previousPeriodLabel,
  
@@ -239,17 +248,22 @@ export class EvaluationsService implements OnModuleInit {
       statusAcknowledgeCount,
       agentsBelow90,
  
-      // Trend chart stays department-filtered but shows FULL history
-      // (independent of the period selector) — its own weekly/monthly/
-      // yearly toggle already controls bucket granularity.
+      // Trend chart stays department-filtered but shows FULL history —
+      // independent of whatever date range is selected above. Its own
+      // weekly/monthly/yearly toggle controls bucket granularity.
       trend,
     };
   }
  
-  // Cached separately from the rest of the summary, keyed only by
-  // department — see the comment at the call site for why.
-  private async getTrendForDepartment(department: string | undefined, records: any[]) {
-    const cacheKey = `trend:${department && department !== "all" ? department : "all"}`;
+  private async getTrendForFilters(
+    department: string | undefined,
+    unit: string | undefined,
+    skill: string | undefined,
+    records: any[]
+  ) {
+    const cacheKey = `trend:${department && department !== "all" ? department : "all"}:${
+      unit && unit !== "all" ? unit : "all"
+    }:${skill && skill !== "all" ? skill : "all"}`;
     const cached = await this.cacheManager.get<{
       weekly: any[];
       monthly: any[];
@@ -266,8 +280,6 @@ export class EvaluationsService implements OnModuleInit {
     return trend;
   }
  
-  // Computes the same pass/fail/score/critical-error stats for an arbitrary
-  // slice of records — used for both "this period" and "previous period".
   private computeStats(records: any[]) {
     const totalEvaluated = records.length;
     const pass = records.filter((r) => r.evaluation_result === "Pass").length;
@@ -307,44 +319,87 @@ export class EvaluationsService implements OnModuleInit {
     };
   }
  
-  // Shared by getDashboardSummary and getAgentFaults — splits an already
-  // department-filtered record set into "this period" / "previous period",
-  // using the latest such period actually present in the data (not the
-  // server clock), so both endpoints agree on exactly what "this period"
-  // means for a given department + period combo.
-  private resolvePeriod(records: any[], period: Period) {
+  // Shared by getDashboardSummary and getAgentFaults.
+  //
+  // With an explicit from/to (from the calendar range picker): the current
+  // period is exactly [from, to] inclusive, and the previous period is an
+  // equal-length window immediately preceding it (so a 7-day selection
+  // compares against the 7 days before that, a 90-day selection against
+  // the 90 days before that, etc).
+  //
+  // Without from/to: falls back to "the latest calendar month present in
+  // the data" vs the month before it — the original default behavior,
+  // used for the dashboard's first paint before anyone's touched the
+  // calendar picker.
+  private resolveDateRange(records: any[], from?: string, to?: string) {
+    if (from && to) {
+      const fromDate = new Date(`${from}T00:00:00`);
+      const toDate = new Date(`${to}T23:59:59.999`);
+      if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime()) || fromDate > toDate) {
+        // Malformed range — fall through to the default below rather than
+        // silently returning nothing.
+      } else {
+        const rangeMs = toDate.getTime() - fromDate.getTime() + 1;
+        const prevTo = new Date(fromDate.getTime() - 1);
+        const prevFrom = new Date(fromDate.getTime() - rangeMs);
+ 
+        const inRange = (r: any, start: Date, end: Date) => {
+          if (!r.evaluation_date) return false;
+          const d = new Date(r.evaluation_date);
+          return !isNaN(d.getTime()) && d >= start && d <= end;
+        };
+ 
+        const fmt = (d: Date) => d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+ 
+        return {
+          currentRecords: records.filter((r) => inRange(r, fromDate, toDate)),
+          previousRecords: records.filter((r) => inRange(r, prevFrom, prevTo)),
+          periodLabel: `${fmt(fromDate)} – ${fmt(toDate)}`,
+          previousPeriodLabel: `${fmt(prevFrom)} – ${fmt(prevTo)}`,
+        };
+      }
+    }
+ 
+    // Default: latest month present in the data, vs the month before it.
     const dated = records
-      .map((r) => ({ record: r, key: this.periodKeyOf(r.evaluation_date, period) }))
+      .map((r) => ({ record: r, key: this.monthKeyOf(r.evaluation_date) }))
       .filter((d): d is { record: any; key: string } => d.key !== null);
  
     let currentKey: string | null = null;
     if (dated.length > 0) {
       currentKey = dated.reduce((latest, d) => (d.key > latest ? d.key : latest), dated[0].key);
     }
-    const previousKey = currentKey ? this.shiftPeriodKey(currentKey, period) : null;
+    const previousKey = currentKey ? this.shiftMonthKey(currentKey, -1) : null;
  
     const currentRecords = currentKey
       ? dated.filter((d) => d.key === currentKey).map((d) => d.record)
-      : records; // fallback: no parseable dates at all, just use everything
+      : records;
     const previousRecords = previousKey ? dated.filter((d) => d.key === previousKey).map((d) => d.record) : [];
  
     return {
       currentRecords,
       previousRecords,
-      periodLabel: currentKey ? this.formatPeriodKey(currentKey, period) : null,
-      previousPeriodLabel: previousKey ? this.formatPeriodKey(previousKey, period) : null,
+      periodLabel: currentKey ? this.formatMonthKey(currentKey) : null,
+      previousPeriodLabel: previousKey ? this.formatMonthKey(previousKey) : null,
     };
   }
  
   // Per-agent fault breakdown for the Agents Below 90 double-click drill-down
-  // — same department + period scoping as the dashboard summary, so the
-  // numbers shown here always match what produced that agent's score there.
-  async getAgentFaults(email: string, department?: string, period: Period = "month") {
+  // — same department + date-range scoping as the dashboard summary.
+  async getAgentFaults(
+    email: string,
+    department?: string,
+    unit?: string,
+    skill?: string,
+    from?: string,
+    to?: string
+  ) {
     const all = await this.getAllRecords();
-    const deptRecords =
-      department && department !== "all" ? all.filter((r) => r.department === department) : all;
+    let filtered = department && department !== "all" ? all.filter((r) => r.department === department) : all;
+    if (unit && unit !== "all") filtered = filtered.filter((r) => r.group === unit);
+    if (skill && skill !== "all") filtered = filtered.filter((r) => r.skill_phone === skill);
  
-    const { currentRecords, periodLabel } = this.resolvePeriod(deptRecords, period);
+    const { currentRecords, periodLabel } = this.resolveDateRange(filtered, from, to);
  
     const agentRecords = currentRecords.filter(
       (r) => (r.employee_email ?? r.evaluatee_full_name) === email
@@ -373,7 +428,6 @@ export class EvaluationsService implements OnModuleInit {
       name: agentRecords[0].evaluatee_full_name,
       email,
       department: department && department !== "all" ? department : "all",
-      period,
       periodLabel,
       score,
       evaluationCount: agentRecords.length,
@@ -382,57 +436,24 @@ export class EvaluationsService implements OnModuleInit {
     };
   }
  
-  // ---- Generic period-key helpers (week / month / year) ----
+  // ---- Month-key helpers (used only for the no-range default fallback) ----
  
-  private periodKeyOf(dateStr: unknown, period: Period): string | null {
+  private monthKeyOf(dateStr: unknown): string | null {
     if (typeof dateStr !== "string" || !dateStr) return null;
     const d = new Date(dateStr);
     if (isNaN(d.getTime())) return null;
-    if (period === "year") return `${d.getFullYear()}`;
-    if (period === "month") return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-    return `${d.getFullYear()}-W${this.getISOWeek(d)}`;
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
   }
  
-  private shiftPeriodKey(key: string, period: Period): string {
-    if (period === "year") {
-      return `${Number(key) - 1}`;
-    }
-    if (period === "month") {
-      const [y, m] = key.split("-").map(Number);
-      const d = new Date(y, m - 1 - 1, 1);
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-    }
-    // week: "YYYY-Www" — find a date inside that ISO week, step back 7 days, recompute the key
-    const [yStr, wStr] = key.split("-W");
-    const y = Number(yStr);
-    const w = Number(wStr);
-    const approx = new Date(y, 0, 1 + (w - 1) * 7);
-    const dayOfWeek = approx.getDay() || 7;
-    const isoThursday = new Date(approx);
-    isoThursday.setDate(approx.getDate() - dayOfWeek + 4);
-    isoThursday.setDate(isoThursday.getDate() - 7);
-    return this.periodKeyOf(isoThursday.toISOString(), "week")!;
+  private shiftMonthKey(key: string, delta: number): string {
+    const [y, m] = key.split("-").map(Number);
+    const d = new Date(y, m - 1 + delta, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
   }
  
-  private formatPeriodKey(key: string, period: Period): string {
-    if (period === "year") return key;
-    if (period === "month") {
-      const [y, m] = key.split("-").map(Number);
-      return new Date(y, m - 1, 1).toLocaleString("en-US", { month: "short", year: "numeric" });
-    }
-    // "YYYY-Www" -> a representative date in that ISO week (its Thursday,
-    // same convention used in shiftPeriodKey) -> "Aug 2026 W3" style label.
-    // The underlying ISO-week grouping/math is untouched — this only
-    // affects how the key is displayed.
-    const [yStr, wStr] = key.split("-W");
-    const y = Number(yStr);
-    const w = Number(wStr);
-    const approx = new Date(y, 0, 1 + (w - 1) * 7);
-    const dayOfWeek = approx.getDay() || 7;
-    const thursday = new Date(approx);
-    thursday.setDate(approx.getDate() - dayOfWeek + 4);
-    const weekOfMonth = Math.ceil(thursday.getDate() / 7);
-    return `${thursday.toLocaleString("en-US", { month: "short" })} ${thursday.getFullYear()} W${weekOfMonth}`;
+  private formatMonthKey(key: string): string {
+    const [y, m] = key.split("-").map(Number);
+    return new Date(y, m - 1, 1).toLocaleString("en-US", { month: "short", year: "numeric" });
   }
  
   async getAgentsList() {
@@ -463,9 +484,6 @@ export class EvaluationsService implements OnModuleInit {
     const statusCoachCount = records.filter((r) => r.status_flow === "Completed").length;
     const statusAcknowledgeCount = records.filter((r) => r.status_acknowledge === "Complete").length;
  
-    // "Top errors this month" — uses the most recent calendar month present
-    // in THIS agent's own records, rather than the server clock, so it still
-    // shows something sensible if the underlying data isn't actually current.
     const dated = records
       .filter((r) => r.evaluation_date)
       .map((r) => ({ record: r, date: new Date(r.evaluation_date) }))
@@ -514,8 +532,6 @@ export class EvaluationsService implements OnModuleInit {
       statusAcknowledgeCount,
       topErrorsThisMonth,
       topErrorsMonthLabel,
-      // Not present anywhere in raw-data — surfaced as null so the frontend
-      // can render "N/A" rather than a fabricated number.
       coachingLevel: null as string | null,
       ivrTop3Box: null as number | null,
       ivrBottomBox: null as number | null,
@@ -544,10 +560,8 @@ export class EvaluationsService implements OnModuleInit {
         label = sortKey;
       } else if (unit === "month") {
         sortKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
-        label = date.toLocaleString("en-US", { month: "short", year: "numeric" }); // "Aug 2026"
+        label = date.toLocaleString("en-US", { month: "short", year: "numeric" });
       } else {
-        // Week-of-month, not ISO week-of-year — "Aug 2026 W3" reads far
-        // better on a chart axis than "2026-W35".
         const weekOfMonth = Math.ceil(date.getDate() / 7);
         sortKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${weekOfMonth}`;
         label = `${date.toLocaleString("en-US", { month: "short" })} ${date.getFullYear()} W${weekOfMonth}`;
