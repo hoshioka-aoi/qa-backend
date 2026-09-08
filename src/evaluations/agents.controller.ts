@@ -18,12 +18,16 @@ export class AgentsController {
   }
 
   @Get("summary")
-  @CacheTTL(60 * 1000) // CacheInterceptor keys by full URL, so ?email=a and ?email=b cache separately
-  async getAgentSummary(@Query("email") email: string) {
+  @CacheTTL(60 * 1000)
+  async getAgentSummary(
+    @Query("email") email: string,
+    @Query("from") from?: string,
+    @Query("to") to?: string
+  ) {
     if (!email) {
       throw new NotFoundException("Missing required query param: email");
     }
-    const summary = await this.evaluationsService.getAgentSummary(email);
+    const summary = await this.evaluationsService.getAgentSummary(email, from, to);
     if (!summary) {
       throw new NotFoundException(`No evaluations found for agent: ${email}`);
     }

@@ -437,71 +437,69 @@ export class EvaluationsService implements OnModuleInit {
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  async getAgentSummary(email: string) {
+  async getAgentSummary(email: string, from?: string, to?: string) {
     const allRecords = await this.getAllRecords();
     const records = allRecords.filter((r) => (r.employee_email ?? r.evaluatee_full_name) === email);
     if (records.length === 0) return null;
 
-    const totalEvaluated = records.length;
-    const pass = records.filter((r) => r.evaluation_result === "Pass").length;
-    const fail = totalEvaluated - pass;
-    const qaScore = (records.reduce((sum, r) => sum + (r.score_sum ?? 0), 0) / totalEvaluated) * 100;
+    const { currentRecords, previousRecords, periodLabel, previousPeriodLabel } =
+      this.resolveDateRange(records, from, to);
 
-    const statusCoachCount = records.filter((r) => r.status_flow === "Completed").length;
-    const statusAcknowledgeCount = records.filter((r) => r.status_acknowledge === "Complete").length;
+    const currentStats = this.computeStats(currentRecords);
+    const previousStats = this.computeStats(previousRecords);
 
-    const dated = records
-      .filter((r) => r.evaluation_date)
-      .map((r) => ({ record: r, date: new Date(r.evaluation_date) }))
-      .filter((d) => !isNaN(d.date.getTime()));
+    const statusCoachCount = currentRecords.filter((r) => r.status_flow === "Completed").length;
+    const statusAcknowledgeCount = currentRecords.filter((r) => r.status_acknowledge === "Complete").length;
 
-    let topErrorsThisMonth: { label: string; count: number; pct: number }[] = [];
-    let topErrorsMonthLabel: string | null = null;
-
-    if (dated.length > 0) {
-      const latest = dated.reduce((a, b) => (a.date > b.date ? a : b));
-      const y = latest.date.getFullYear();
-      const m = latest.date.getMonth();
-      topErrorsMonthLabel = latest.date.toLocaleString("en-US", { month: "short", year: "numeric" });
-
-      const monthRecords = dated
-        .filter((d) => d.date.getFullYear() === y && d.date.getMonth() === m)
-        .map((d) => d.record);
-
-      const failCounts = new Map<string, number>();
-      for (const r of monthRecords) {
-        for (const c of CRITERIA) {
-          if ((r as any)[c.key] === FAIL_VALUE) {
-            failCounts.set(c.key, (failCounts.get(c.key) ?? 0) + 1);
-          }
+    // Top errors for whichever period is currently in scope (a custom
+    // range from the calendar picker, or the default latest-month
+    // fallback) — same failCounts approach as before, just sourced from
+    // currentRecords instead of a separately-computed "latest month".
+    const failCounts = new Map<string, number>();
+    for (const r of currentRecords) {
+      for (const c of CRITERIA) {
+        if ((r as any)[c.key] === FAIL_VALUE) {
+          failCounts.set(c.key, (failCounts.get(c.key) ?? 0) + 1);
         }
       }
-      const totalFails = [...failCounts.values()].reduce((a, b) => a + b, 0);
-
-      topErrorsThisMonth = CRITERIA.map((c) => ({ label: c.label, count: failCounts.get(c.key) ?? 0 }))
-        .filter((e) => e.count > 0)
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 5)
-        .map((e) => ({ ...e, pct: totalFails ? Math.round((e.count / totalFails) * 100) : 0 }));
     }
+    const totalFails = [...failCounts.values()].reduce((a, b) => a + b, 0);
+    const topErrorsThisMonth = CRITERIA.map((c) => ({ label: c.label, count: failCounts.get(c.key) ?? 0 }))
+      .filter((e) => e.count > 0)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5)
+      .map((e) => ({ ...e, pct: totalFails ? Math.round((e.count / totalFails) * 100) : 0 }));
 
     return {
       name: records[0].evaluatee_full_name,
       email,
       team: records[0].group ?? records[0].department ?? "",
       role: records[0].position ?? "",
-      qaScore,
-      totalEvaluated,
-      pass,
-      fail,
+
+      qaScore: currentStats.overallScore,
+      previousQaScore: previousStats.overallScore,
+
+      totalEvaluated: currentStats.totalEvaluated,
+      previousTotalEvaluated: previousStats.totalEvaluated,
+
+      pass: currentStats.pass,
+      previousPass: previousStats.pass,
+
+      fail: currentStats.fail,
+      previousFail: previousStats.fail,
+
       statusCoachCount,
       statusAcknowledgeCount,
       topErrorsThisMonth,
-      topErrorsMonthLabel,
+      topErrorsMonthLabel: periodLabel,
+      previousPeriodLabel,
       coachingLevel: null as string | null,
       ivrTop3Box: null as number | null,
       ivrBottomBox: null as number | null,
       verifyAttempts: [] as { attempt: string; score: number }[],
+
+      // Trend stays full history regardless of the selected date range —
+      // same reasoning as the dashboard's trend chart.
       trend: {
         weekly: this.bucketTrend(records, "week"),
         monthly: this.bucketTrend(records, "month"),
