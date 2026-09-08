@@ -11,10 +11,6 @@ interface CriterionDef {
   critical: boolean;
 }
 
-// Single source of truth for which fields are critical, and how they're
-// labeled for display. Matches the column names produced by the CSV import
-// (no more "1_1_" / "2_3_" number prefixes — those were dropped when the
-// raw export was translated).
 const CRITERIA: CriterionDef[] = [
   { key: "greeting_introduction_and_closing_per_standard", label: "กล่าวประโยคต้อนรับ แนะนำตัว และกล่าวจบการสนทนา ไม่ตามมาตรฐานที่กำหนด", critical: false },
   { key: "request_customer_name_and_phone_per_standard_critical_bus", label: "ขอชื่อ-นามสกุล เบอร์โทรลูกค้า/ผู้ติดต่อ ไม่ตามมาตรฐานที่กำหนด", critical: true },
@@ -39,9 +35,6 @@ const CRITERIA: CriterionDef[] = [
 
 const FAIL_VALUE = "ไม่เป็นไปตามมาตรฐาน";
 
-// The raw-data collection has 144 columns; the aggregation logic below only
-// ever reads this subset. `ul` (unit) and `skill` were added so agents can
-// be sorted/displayed by them, on top of the existing department/group.
 const FIELD_PROJECTION = {
   evaluatee_full_name: 1,
   employee_email: 1,
@@ -61,6 +54,7 @@ const FIELD_PROJECTION = {
 export class EvaluationsService implements OnModuleInit {
   private static readonly RECORDS_CACHE_KEY = "raw-data:all-records";
   private readonly logger = new Logger(EvaluationsService.name);
+  private fetchPromise: Promise<any[]> | null = null;
 
   constructor(
     @InjectModel(Evaluation.name)
@@ -69,17 +63,7 @@ export class EvaluationsService implements OnModuleInit {
     private readonly cacheManager: Cache
   ) {}
 
-  // Runs once when the Nest app finishes booting — pre-loads the raw-data
-  // cache immediately, so whoever's browser hits the dashboard/reports page
-  // FIRST doesn't have to pay for the cold-cache fetch themselves.
   async onModuleInit() {
-    // Blocking on purpose: the app won't report "started" (and nginx won't
-    // have anything to proxy to) until this finishes — but that means
-    // whoever visits gets a fast, already-warm page instead of triggering
-    // the slow Mongo fetch themselves on first load. Revisit this once the
-    // underlying Mongo/Atlas latency from inside Docker is actually fixed
-    // (see the DNS diagnostic) — at that point this delay should shrink to
-    // something small enough that this tradeoff stops mattering either way.
     await this.warmCaches();
   }
 
@@ -102,46 +86,34 @@ export class EvaluationsService implements OnModuleInit {
     }
   }
 
-  // The one place that actually talks to MongoDB for the full collection.
-  // Add this property to your class, right below the logger
-private fetchPromise: Promise<any[]> | null = null;
+  private async getAllRecords(): Promise<any[]> {
+    const cached = await this.cacheManager.get<any[]>(EvaluationsService.RECORDS_CACHE_KEY);
+    if (cached) return cached;
 
-// Replace your entire getAllRecords method with this:
-private async getAllRecords(): Promise<any[]> {
-  // 1. Check cache
-  const cached = await this.cacheManager.get<any[]>(EvaluationsService.RECORDS_CACHE_KEY);
-  if (cached) return cached;
+    if (this.fetchPromise) {
+      this.logger.debug("getAllRecords: Waiting for ongoing DB fetch...");
+      return this.fetchPromise;
+    }
 
-  // 2. If a fetch is already in progress, wait for it (prevents stampede)
-  if (this.fetchPromise) {
-    this.logger.debug('getAllRecords: Waiting for ongoing DB fetch...');
+    this.fetchPromise = (async () => {
+      try {
+        const start = Date.now();
+        const records = await this.evaluationModel.find({}, FIELD_PROJECTION).lean();
+        this.logger.log(`Cache MISS — fetched ${records.length} records from MongoDB in ${Date.now() - start}ms`);
+        await this.cacheManager.set(EvaluationsService.RECORDS_CACHE_KEY, records, 0);
+        return records;
+      } finally {
+        this.fetchPromise = null;
+      }
+    })();
+
     return this.fetchPromise;
   }
-
-  // 3. Start a new fetch and store the promise
-  this.fetchPromise = (async () => {
-    try {
-      const start = Date.now();
-      const records = await this.evaluationModel.find({}, FIELD_PROJECTION).lean();
-      this.logger.log(`Cache MISS — fetched ${records.length} records from MongoDB in ${Date.now() - start}ms`);
-      
-      // TTL = 0 means "never expire". We rely on manual invalidateCache().
-      await this.cacheManager.set(EvaluationsService.RECORDS_CACHE_KEY, records, 0);
-      return records;
-    } finally {
-      // Clear the promise so the next MISS can trigger a fresh fetch
-      this.fetchPromise = null;
-    }
-  })();
-
-  return this.fetchPromise;
-}
 
   async invalidateCache() {
     await this.cacheManager.del(EvaluationsService.RECORDS_CACHE_KEY);
   }
 
-  // Distinct department names, for the dashboard's department filter dropdown.
   async getDepartments(): Promise<string[]> {
     const records = await this.getAllRecords();
     const set = new Set<string>();
@@ -152,9 +124,6 @@ private async getAllRecords(): Promise<any[]> {
     return [...set].sort((a, b) => a.localeCompare(b));
   }
 
-  // Distinct unit (group) and skill (skill_phone) values, for the
-  // dashboard's Unit and Skill filter dropdowns — same pattern as
-  // getDepartments above.
   async getUnits(): Promise<string[]> {
     return this.getDistinctValues("group");
   }
@@ -173,11 +142,6 @@ private async getAllRecords(): Promise<any[]> {
     return [...set].sort((a, b) => a.localeCompare(b));
   }
 
-  // department: optional filter, applies to the whole page.
-  // from / to: optional ISO date strings ("YYYY-MM-DD") from the calendar
-  // range picker. When omitted, falls back to "the latest month present
-  // in the data" (same behavior as before the range picker existed), so
-  // the dashboard still shows something sensible on first load.
   async getDashboardSummary(
     department?: string,
     unit?: string,
@@ -204,8 +168,7 @@ private async getAllRecords(): Promise<any[]> {
     const statusCoachCount = currentRecords.filter((r) => r.status_flow === "Completed").length;
     const statusAcknowledgeCount = currentRecords.filter((r) => r.status_acknowledge === "Complete").length;
 
-    // Single pass — name/email captured directly in the map entry, so no
-    // second scan through currentRecords is needed afterward.
+    // Single pass — name/email captured directly in the map entry.
     const byAgent = new Map<string, { name: string; email: string; sum: number; count: number }>();
     for (const r of currentRecords) {
       const key = r.employee_email ?? r.evaluatee_full_name;
@@ -219,15 +182,17 @@ private async getAllRecords(): Promise<any[]> {
       entry.count += 1;
       byAgent.set(key, entry);
     }
-    const agentsBelow90 = [...byAgent.values()]
-      .map(({ name, email, sum, count }) => ({ name, email, score: (sum / count) * 100 }))
-      .filter((a) => a.score < 90)
-      .sort((a, b) => a.score - b.score);
+    const allAgentScores = [...byAgent.values()].map(({ name, email, sum, count }) => ({
+      name,
+      email,
+      score: (sum / count) * 100,
+    }));
+    const agentsBelow90 = allAgentScores.filter((a) => a.score < 90).sort((a, b) => a.score - b.score);
+    // Everyone else who has at least one evaluation in this period/filter
+    // scope and is at or above the 90% bar — for the Above/Below 90 tiles.
+    const agentsAbove90Count = allAgentScores.length - agentsBelow90.length;
     const tAgents = Date.now();
 
-    // Trend doesn't depend on the selected date range — only on which
-    // department/unit/skill filters are active — so it's cached
-    // separately, keyed by that filter combination.
     const trend = await this.getTrendForFilters(department, unit, skill, records);
     const tTrend = Date.now();
 
@@ -266,11 +231,9 @@ private async getAllRecords(): Promise<any[]> {
 
       statusCoachCount,
       statusAcknowledgeCount,
+      agentsAbove90Count,
       agentsBelow90,
 
-      // Trend chart stays department-filtered but shows FULL history —
-      // independent of whatever date range is selected above. Its own
-      // weekly/monthly/yearly toggle controls bucket granularity.
       trend,
     };
   }
@@ -339,25 +302,12 @@ private async getAllRecords(): Promise<any[]> {
     };
   }
 
-  // Shared by getDashboardSummary and getAgentFaults.
-  //
-  // With an explicit from/to (from the calendar range picker): the current
-  // period is exactly [from, to] inclusive, and the previous period is an
-  // equal-length window immediately preceding it (so a 7-day selection
-  // compares against the 7 days before that, a 90-day selection against
-  // the 90 days before that, etc).
-  //
-  // Without from/to: falls back to "the latest calendar month present in
-  // the data" vs the month before it — the original default behavior,
-  // used for the dashboard's first paint before anyone's touched the
-  // calendar picker.
   private resolveDateRange(records: any[], from?: string, to?: string) {
     if (from && to) {
       const fromDate = new Date(`${from}T00:00:00`);
       const toDate = new Date(`${to}T23:59:59.999`);
       if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime()) || fromDate > toDate) {
-        // Malformed range — fall through to the default below rather than
-        // silently returning nothing.
+        // fall through
       } else {
         const rangeMs = toDate.getTime() - fromDate.getTime() + 1;
         const prevTo = new Date(fromDate.getTime() - 1);
@@ -380,7 +330,6 @@ private async getAllRecords(): Promise<any[]> {
       }
     }
 
-    // Default: latest month present in the data, vs the month before it.
     const dated = records
       .map((r) => ({ record: r, key: this.monthKeyOf(r.evaluation_date) }))
       .filter((d): d is { record: any; key: string } => d.key !== null);
@@ -404,8 +353,6 @@ private async getAllRecords(): Promise<any[]> {
     };
   }
 
-  // Per-agent fault breakdown for the Agents Below 90 double-click drill-down
-  // — same department + date-range scoping as the dashboard summary.
   async getAgentFaults(
     email: string,
     department?: string,
@@ -456,8 +403,6 @@ private async getAllRecords(): Promise<any[]> {
     };
   }
 
-  // ---- Month-key helpers (used only for the no-range default fallback) ----
-
   private monthKeyOf(dateStr: unknown): string | null {
     if (typeof dateStr !== "string" || !dateStr) return null;
     const d = new Date(dateStr);
@@ -476,15 +421,17 @@ private async getAllRecords(): Promise<any[]> {
     return new Date(y, m - 1, 1).toLocaleString("en-US", { month: "short", year: "numeric" });
   }
 
-  async getAgentsList() {
-    const records = await this.getAllRecords();
+  async getAgentsList(department?: string, unit?: string, skill?: string) {
+    const all = await this.getAllRecords();
+    let records = department && department !== "all" ? all.filter((r) => r.department === department) : all;
+    if (unit && unit !== "all") records = records.filter((r) => r.group === unit);
+    if (skill && skill !== "all") records = records.filter((r) => r.skill_phone === skill);
 
-    const seen = new Map<string, string>(); // email -> name
+    const seen = new Map<string, string>();
     for (const r of records) {
       const key = r.employee_email ?? r.evaluatee_full_name;
       if (key && !seen.has(key)) seen.set(key, r.evaluatee_full_name);
     }
-
     return [...seen.entries()]
       .map(([email, name]) => ({ email, name }))
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -493,7 +440,6 @@ private async getAllRecords(): Promise<any[]> {
   async getAgentSummary(email: string) {
     const allRecords = await this.getAllRecords();
     const records = allRecords.filter((r) => (r.employee_email ?? r.evaluatee_full_name) === email);
-
     if (records.length === 0) return null;
 
     const totalEvaluated = records.length;
@@ -566,7 +512,6 @@ private async getAllRecords(): Promise<any[]> {
 
   private bucketTrend(records: any[], unit: "week" | "month" | "year") {
     const buckets = new Map<string, { sum: number; count: number; label: string }>();
-
     for (const r of records) {
       if (!r.evaluation_date) continue;
       const date = new Date(r.evaluation_date);

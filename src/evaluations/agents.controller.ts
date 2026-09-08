@@ -9,8 +9,12 @@ export class AgentsController {
 
   @Get()
   @CacheTTL(60 * 1000)
-  getAgents() {
-    return this.evaluationsService.getAgentsList();
+  getAgents(
+    @Query("department") department?: string,
+    @Query("unit") unit?: string,
+    @Query("skill") skill?: string
+  ) {
+    return this.evaluationsService.getAgentsList(department, unit, skill);
   }
 
   @Get("summary")
